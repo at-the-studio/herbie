@@ -63,6 +63,7 @@ GEMINI_API_KEY = os.getenv('GEMINI_FLASH_API_KEY')  # For audio analysis only
 ELECTRONHUB_API_KEY = os.getenv('ELECTRONHUB_API_KEY')  # For chat
 ELECTRONHUB_ENDPOINT = os.getenv('ELECTRONHUB_ENDPOINT', 'https://api.electronhub.ai/v1/chat/completions')
 CHAT_MODEL = os.getenv('CHAT_MODEL', 'gemini-2.5-flash')
+FALLBACK_MODEL = os.getenv('FALLBACK_MODEL', 'llama-4-maverick-17b-128e-instruct')
 CHARACTER_FILE = 'herbie_character.json'
 CREATOR_ID = 966507927756234823  # myra_cat / mj — dev
 
@@ -525,25 +526,35 @@ async def get_chat_response(user_prompt, memory, **kwargs):
         "Content-Type": "application/json"
     }
 
-    payload = {
-        "model": CHAT_MODEL,
-        "messages": messages,
-        "max_tokens": 1000
-    }
+    # Try primary model, then fallback
+    for model in [CHAT_MODEL, FALLBACK_MODEL]:
+        payload = {
+            "model": model,
+            "messages": messages,
+            "max_tokens": 1000
+        }
 
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(ELECTRONHUB_ENDPOINT, headers=headers, json=payload) as response:
-                if response.status == 200:
-                    result = await response.json()
-                    return result['choices'][0]['message']['content']
-                else:
-                    error_text = await response.text()
-                    print(f"ElectronHub API error: {response.status} - {error_text}")
-                    return "Hold on now... somethin' went sideways. Try again in a sec."
-    except Exception as e:
-        print(f"ElectronHub API error: {e}")
-        return "Hold on now... somethin' went sideways. Try again in a sec."
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(ELECTRONHUB_ENDPOINT, headers=headers, json=payload) as response:
+                    if response.status == 200:
+                        result = await response.json()
+                        if model != CHAT_MODEL:
+                            print(f"[FALLBACK] Used {model} instead of {CHAT_MODEL}")
+                        return result['choices'][0]['message']['content']
+                    else:
+                        error_text = await response.text()
+                        print(f"ElectronHub API error ({model}): {response.status} - {error_text}")
+                        if model == CHAT_MODEL:
+                            print(f"[FALLBACK] Trying {FALLBACK_MODEL}...")
+                            continue
+        except Exception as e:
+            print(f"ElectronHub API error ({model}): {e}")
+            if model == CHAT_MODEL:
+                print(f"[FALLBACK] Trying {FALLBACK_MODEL}...")
+                continue
+
+    return "Hold on now... somethin' went sideways. Try again in a sec."
 
 
 # --- BOT EVENTS ---
