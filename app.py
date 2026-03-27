@@ -160,6 +160,7 @@ private_mode = {}
 channel_message_history = defaultdict(list)
 message_queue = defaultdict(list)
 processing_queue = set()
+user_locks = defaultdict(asyncio.Lock)  # Per-user lock to prevent message crossing
 max_memory_length = 20
 
 # --- HELPER FUNCTIONS ---
@@ -680,9 +681,11 @@ async def on_message(message):
         return
 
     if should_respond:
-        async with message.channel.typing():
+        user_id = message.author.id
+        lock_key = f"{user_id}_{channel_id}"
+        async with user_locks[lock_key]:
+          async with message.channel.typing():
             try:
-                user_id = message.author.id
                 memory = get_user_memory(user_id, channel_id)
                 user_input = message.content.replace(f'<@!{bot.user.id}>', '').replace(f'<@{bot.user.id}>', '').strip()
 
