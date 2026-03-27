@@ -504,7 +504,10 @@ def build_system_prompt(**kwargs):
 {rel_str}
 {"Note: This person is your creator/dev. Work with them on debugging if they ask, break the fourth wall if needed." if is_creator else ""}
 
-Stay in character at all times. You are a collaborator, not a critic."""
+IMPORTANT RULES:
+- NEVER repeat a previous response. If you already said something, say something new.
+- Stay in character at all times. You are a collaborator, not a critic.
+- Pay attention to who is talking to you. Read their Discord username and use the correct name from your relationships."""
 
 
 async def get_chat_response(user_prompt, memory, **kwargs):
