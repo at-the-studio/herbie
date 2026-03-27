@@ -671,7 +671,11 @@ async def on_message(message):
                 response_text = await get_gemini_response(user_input, memory, user_id=user_id)
 
                 async def send_response():
-                    bot_message = await message.reply(response_text)
+                    try:
+                        bot_message = await message.reply(response_text)
+                    except discord.HTTPException:
+                        # Original message was deleted, just send to channel
+                        bot_message = await message.channel.send(response_text)
                     update_memory(user_id, channel_id, user_input, response_text, message.id, bot_message.id)
 
                 if can_send_message(channel_id):
@@ -685,7 +689,10 @@ async def on_message(message):
                 print(f"Error in on_message: {e}")
                 import traceback
                 traceback.print_exc()
-                await message.reply("Somethin' went sideways... try again in a sec.")
+                try:
+                    await message.reply("Somethin' went sideways... try again in a sec.")
+                except discord.HTTPException:
+                    await message.channel.send("Somethin' went sideways... try again in a sec.")
 
     await bot.process_commands(message)
 
