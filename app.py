@@ -402,6 +402,72 @@ Be thorough and natural. This will be used by a music collaborator character to 
         return None
 
 
+# --- SUNO LINK AUDIO EXTRACTION ---
+
+SUNO_URL_PATTERN = re.compile(r'https?://(?:www\.)?suno\.com/s/([\w-]+)')
+
+async def extract_audio_from_suno_url(url):
+    """Extract MP3 audio URL and metadata from a Suno share link."""
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
+            async with session.get(url) as resp:
+                if resp.status != 200:
+                    print(f"[SUNO] Failed to fetch page: HTTP {resp.status}")
+                    return None
+                html = await resp.text()
+
+        # Extract audio_url from embedded data
+        audio_match = re.search(r'audio_url[\\]?"[:\s]*[\\]?"(https?://cdn[12]\.suno\.ai/[^"\\]+\.mp3)', html)
+        if not audio_match:
+            print(f"[SUNO] Could not find audio_url in page HTML")
+            return None
+
+        audio_url = audio_match.group(1)
+        print(f"[SUNO] Found audio URL: {audio_url}")
+
+        # Extract title
+        title = "Unknown Track"
+        title_match = re.search(r'<meta\s+property="og:title"\s+content="([^"]*)"', html)
+        if title_match:
+            title = title_match.group(1)
+        print(f"[SUNO] Track title: {title}")
+
+        return {'audio_url': audio_url, 'title': title}
+
+    except asyncio.TimeoutError:
+        print(f"[SUNO] Timed out fetching page: {url}")
+        return None
+    except Exception as e:
+        print(f"[SUNO] Error extracting audio from {url}: {e}")
+        return None
+
+
+async def download_suno_audio(audio_url):
+    """Download MP3 from Suno CDN. Returns (bytes, 'audio/mp3') or (None, None)."""
+    max_size = AUDIO_MAX_SIZE_MB * 1024 * 1024
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+            async with session.get(audio_url) as resp:
+                if resp.status != 200:
+                    print(f"[SUNO] Failed to download audio: HTTP {resp.status}")
+                    return None, None
+                content_length = resp.headers.get('Content-Length')
+                if content_length and int(content_length) > max_size:
+                    print(f"[SUNO] Audio too large: {content_length} bytes")
+                    return None, None
+                audio_bytes = await resp.read()
+                if len(audio_bytes) > max_size:
+                    return None, None
+                print(f"[SUNO] Downloaded audio: {len(audio_bytes)} bytes")
+                return audio_bytes, 'audio/mp3'
+    except asyncio.TimeoutError:
+        print(f"[SUNO] Download timed out")
+        return None, None
+    except Exception as e:
+        print(f"[SUNO] Download error: {e}")
+        return None, None
+
+
 # --- GEMINI CHAT API ---
 
 async def get_gemini_response(user_prompt, memory, **kwargs):
@@ -569,6 +635,38 @@ async def on_message(message):
                         except Exception as audio_err:
                             print(f"[AUDIO] Error: {audio_err}")
                             user_input += "\n\n[The user sent audio but there was an error processing it. Acknowledge it briefly.]"
+
+                # --- SUNO LINK DETECTION ---
+                suno_urls = SUNO_URL_PATTERN.findall(user_input or '')
+                if not suno_urls:
+                    suno_urls = SUNO_URL_PATTERN.findall(message.content or '')
+                if suno_urls and AUDIO_PROCESSING_AVAILABLE:
+                    for suno_id in suno_urls:
+                        suno_link = f"https://suno.com/s/{suno_id}"
+                        print(f"[SUNO] Detected Suno link: {suno_link}")
+                        try:
+                            suno_info = await extract_audio_from_suno_url(suno_link)
+                            if suno_info and suno_info.get('audio_url'):
+                                audio_bytes, mime_type = await download_suno_audio(suno_info['audio_url'])
+                                if audio_bytes:
+                                    audio_description = await understand_audio_with_gemini(
+                                        audio_bytes, mime_type,
+                                        user_context=user_input,
+                                        is_voice_message=False
+                                    )
+                                    if audio_description:
+                                        track_title = suno_info.get('title', 'Unknown Track')
+                                        user_input += f'\n\n[The user shared a Suno track "{track_title}" ({suno_link}). Here\'s what you heard: {audio_description}]'
+                                        print(f"[SUNO] Audio analysis injected ({len(audio_description)} chars)")
+                                    else:
+                                        user_input += f"\n\n[The user shared a Suno link ({suno_link}) but audio analysis is currently unavailable. Acknowledge the track and ask them to describe it.]"
+                                else:
+                                    user_input += f"\n\n[The user shared a Suno link ({suno_link}) but the audio couldn't be downloaded. Acknowledge the link.]"
+                            else:
+                                user_input += f"\n\n[The user shared a Suno link ({suno_link}) but you couldn't extract the audio. Acknowledge the link.]"
+                        except Exception as suno_err:
+                            print(f"[SUNO] Error: {suno_err}")
+                            user_input += f"\n\n[The user shared a Suno link but there was an error processing it. Acknowledge it.]"
 
                 response_text = await get_gemini_response(user_input, memory, user_id=user_id)
 
