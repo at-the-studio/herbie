@@ -772,6 +772,29 @@ async def settings_cmd(interaction: discord.Interaction):
 
 # --- INFO ---
 
+@bot.command(name='sync')
+@commands.is_owner()
+async def sync_commands(ctx):
+    """Force sync slash commands to all guilds."""
+    try:
+        synced = await bot.tree.sync()
+        msg = f"Synced {len(synced)} global command(s)."
+        for guild in bot.guilds:
+            try:
+                bot.tree.copy_global_to(guild=guild)
+                gs = await bot.tree.sync(guild=guild)
+                msg += f"\n  {guild.name}: {len(gs)} commands"
+            except Exception as e:
+                msg += f"\n  {guild.name}: failed — {e}"
+        await ctx.send(msg)
+    except Exception as e:
+        await ctx.send(f"Sync failed: {e}")
+
+@sync_commands.error
+async def sync_error(ctx, error):
+    if isinstance(error, commands.NotOwner):
+        await ctx.send("Only the bot owner can sync commands.")
+
 @bot.command(name='info')
 async def info(ctx):
     info_text = """**Herbie's Commands**
