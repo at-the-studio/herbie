@@ -1,0 +1,606 @@
+# Herbie the Holler Bot — Hillbilly Haven
+# Uses Google Gemini for both chat and audio analysis
+
+import subprocess
+import sys
+
+def install_requirements():
+    required = ['discord.py', 'python-dotenv', 'aiohttp', 'google-genai']
+    for package in required:
+        try:
+            pkg = package.replace('.py', '').replace('-', '_')
+            if pkg == 'google_genai':
+                from google import genai
+            else:
+                __import__(pkg)
+        except ImportError:
+            print(f"Installing {package}...")
+            subprocess.check_call([sys.executable, "-m", "pip", "install", package])
+
+try:
+    import discord
+except ImportError:
+    install_requirements()
+    import discord
+
+from discord.ext import commands
+from discord import app_commands
+import aiohttp
+import json
+import os
+import re
+from dotenv import load_dotenv
+from datetime import datetime
+from collections import defaultdict
+import time
+import asyncio
+
+# --- AUDIO PROCESSING ---
+try:
+    from google import genai
+    from google.genai import types as genai_types
+    AUDIO_PROCESSING_AVAILABLE = True
+    print("Audio processing: available (google-genai loaded)")
+except ImportError:
+    AUDIO_PROCESSING_AVAILABLE = False
+    print("Audio processing: unavailable (install google-genai)")
+
+# --- CONFIGURATION ---
+load_dotenv()
+
+DISCORD_TOKEN = os.getenv('HERBIE_DISCORD_TOKEN')
+GEMINI_API_KEY = os.getenv('GEMINI_FLASH_API_KEY')
+GEMINI_MODEL = os.getenv('HERBIE_MODEL', 'gemini-3-flash-preview')
+CHARACTER_FILE = 'herbie_character.json'
+CREATOR_ID = 966507927756234823  # myra_cat / mj — dev
+
+# Audio config
+GOOGLE_AUDIO_MODEL = os.getenv('GOOGLE_AUDIO_MODEL', 'gemini-3-flash-preview')
+AUDIO_MAX_SIZE_MB = int(os.getenv('AUDIO_MAX_SIZE_MB', '20'))
+AUDIO_CONTENT_TYPES = {
+    'audio/ogg', 'audio/wav', 'audio/mp3', 'audio/mpeg',
+    'audio/aac', 'audio/flac', 'audio/aiff', 'audio/x-wav', 'audio/opus'
+}
+
+# --- RATE LIMITING ---
+RATE_LIMIT_MESSAGES = 5
+RATE_LIMIT_WINDOW = 5.0
+RATE_LIMIT_COOLDOWN = 1.0
+
+# --- BOT SETUP ---
+intents = discord.Intents.default()
+intents.message_content = True
+intents.members = True
+intents.reactions = True
+
+bot = commands.Bot(command_prefix="!", intents=intents)
+bot.remove_command('help')
+
+# --- GLOBAL STATE ---
+character_data = {}
+user_memories = {}
+channel_settings = {}
+private_mode = {}
+channel_message_history = defaultdict(list)
+message_queue = defaultdict(list)
+processing_queue = set()
+max_memory_length = 20
+
+# --- HELPER FUNCTIONS ---
+def get_channel_settings(channel_id):
+    if channel_id not in channel_settings:
+        channel_settings[channel_id] = {"active": False}
+    return channel_settings[channel_id]
+
+def clean_old_timestamps(channel_id):
+    current_time = time.time()
+    channel_message_history[channel_id] = [
+        ts for ts in channel_message_history[channel_id]
+        if current_time - ts < RATE_LIMIT_WINDOW
+    ]
+
+def can_send_message(channel_id):
+    clean_old_timestamps(channel_id)
+    return len(channel_message_history[channel_id]) < RATE_LIMIT_MESSAGES
+
+def record_message_sent(channel_id):
+    channel_message_history[channel_id].append(time.time())
+
+async def process_message_queue(channel_id):
+    if channel_id in processing_queue:
+        return
+    processing_queue.add(channel_id)
+    try:
+        while message_queue[channel_id]:
+            while not can_send_message(channel_id):
+                await asyncio.sleep(0.5)
+            if message_queue[channel_id]:
+                message_data = message_queue[channel_id].pop(0)
+                await message_data['callback']()
+                record_message_sent(channel_id)
+                await asyncio.sleep(RATE_LIMIT_COOLDOWN)
+    finally:
+        processing_queue.remove(channel_id)
+        if not message_queue[channel_id]:
+            del message_queue[channel_id]
+
+def get_user_memory(user_id, channel_id):
+    key = f"{user_id}_{channel_id}"
+    if key not in user_memories:
+        user_memories[key] = []
+    return user_memories[key]
+
+def update_memory(user_id, channel_id, user_input, bot_response, user_msg_id, bot_msg_id):
+    key = f"{user_id}_{channel_id}"
+    if key not in user_memories:
+        user_memories[key] = []
+    if user_input:
+        user_memories[key].append({"role": "user", "content": user_input, "id": user_msg_id})
+    user_memories[key].append({"role": "model", "content": bot_response, "id": bot_msg_id})
+    # Trim
+    if len(user_memories[key]) > max_memory_length * 2:
+        user_memories[key] = user_memories[key][-(max_memory_length * 2):]
+
+
+# --- AUDIO FUNCTIONS (ported from Lang) ---
+
+def extract_audio_from_message(message):
+    """Extract audio attachments from a Discord message."""
+    audio_attachments = []
+    if not hasattr(message, 'attachments') or not message.attachments:
+        return audio_attachments
+
+    for attachment in message.attachments:
+        is_audio = False
+
+        # Check content_type
+        if attachment.content_type and attachment.content_type.split(';')[0].strip() in AUDIO_CONTENT_TYPES:
+            is_audio = True
+
+        # Check Discord voice message
+        if hasattr(attachment, 'is_voice_message') and attachment.is_voice_message():
+            is_audio = True
+
+        # Check file extension
+        if not is_audio and attachment.filename:
+            audio_extensions = {'.mp3', '.wav', '.ogg', '.flac', '.aac', '.aiff', '.m4a', '.opus'}
+            ext = os.path.splitext(attachment.filename)[1].lower()
+            if ext in audio_extensions:
+                is_audio = True
+
+        if is_audio:
+            mime_type = attachment.content_type.split(';')[0].strip() if attachment.content_type else 'audio/ogg'
+            mime_map = {
+                'audio/mpeg': 'audio/mp3',
+                'audio/x-wav': 'audio/wav',
+                'audio/opus': 'audio/ogg',
+            }
+            mime_type = mime_map.get(mime_type, mime_type)
+
+            audio_attachments.append({
+                'url': attachment.url,
+                'filename': attachment.filename,
+                'size': attachment.size,
+                'content_type': mime_type,
+                'is_voice_message': hasattr(attachment, 'is_voice_message') and attachment.is_voice_message(),
+                'duration': getattr(attachment, 'duration', None),
+            })
+            print(f"[AUDIO] Found: {attachment.filename} ({mime_type}, {attachment.size} bytes)")
+
+    return audio_attachments
+
+
+async def download_audio_attachment(attachment_info):
+    """Download audio from Discord CDN. Returns (bytes, mime_type) or (None, None)."""
+    url = attachment_info['url']
+    size = attachment_info.get('size', 0)
+    max_size = AUDIO_MAX_SIZE_MB * 1024 * 1024
+
+    if size > max_size:
+        print(f"[AUDIO] File too large: {size} bytes (max {max_size})")
+        return None, None
+
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    audio_bytes = await resp.read()
+                    print(f"[AUDIO] Downloaded: {len(audio_bytes)} bytes")
+                    return audio_bytes, attachment_info['content_type']
+                else:
+                    print(f"[AUDIO] Download failed: HTTP {resp.status}")
+                    return None, None
+    except asyncio.TimeoutError:
+        print("[AUDIO] Download timed out")
+        return None, None
+    except Exception as e:
+        print(f"[AUDIO] Download error: {e}")
+        return None, None
+
+
+async def understand_audio_with_gemini(audio_bytes, mime_type, user_context="", is_voice_message=False):
+    """Send audio to Gemini for analysis. Returns description string or None."""
+    if not AUDIO_PROCESSING_AVAILABLE or not GEMINI_API_KEY:
+        return None
+
+    try:
+        if is_voice_message:
+            analysis_prompt = """Listen to this voice message and describe what was said.
+Include:
+- What the person is saying (full content)
+- Their tone and emotional state
+- Any background sounds
+- If they're singing, describe the song"""
+        else:
+            analysis_prompt = """Listen to this audio and describe it.
+
+If this is MUSIC:
+- Genre/style
+- Instruments you hear
+- Melody, harmony, tempo, mood
+- Vocals and lyrics if present
+- Technical skill and production quality
+- What's working well and what could hit harder
+
+If this is SPEECH:
+- What is being said (full content)
+- Tone and emotional state
+
+If this is OTHER AUDIO:
+- Describe what you hear in detail
+
+Be thorough and natural. This will be used by a music collaborator character to give feedback."""
+
+        if user_context:
+            analysis_prompt += f'\n\nThe user also said: "{user_context}"'
+
+        client = genai.Client(api_key=GEMINI_API_KEY)
+        audio_part = genai_types.Part.from_bytes(data=audio_bytes, mime_type=mime_type)
+
+        response = await client.aio.models.generate_content(
+            model=GOOGLE_AUDIO_MODEL,
+            contents=[analysis_prompt, audio_part],
+        )
+
+        if response and response.text:
+            print(f"[AUDIO] Analysis complete ({len(response.text)} chars)")
+            return response.text
+        return None
+
+    except Exception as e:
+        print(f"[AUDIO] Analysis error: {e}")
+        return None
+
+
+# --- GEMINI CHAT API ---
+
+async def get_gemini_response(user_prompt, memory, **kwargs):
+    """Get a response from Gemini API."""
+    is_creator = str(kwargs.get('user_id')) == str(CREATOR_ID) if CREATOR_ID else False
+
+    # Use the full system prompt from character.json if available, otherwise build one
+    base_prompt = character_data.get('system_prompt', '')
+    if not base_prompt:
+        base_prompt = f"You are {character_data.get('name', 'Herbie the Holler Bot')}.\n{character_data.get('description', '')}\nPersonality: {character_data.get('personality', '')}"
+
+    # Build example dialogue string
+    examples = character_data.get('example_dialogue', [])
+    example_str = ""
+    if examples:
+        example_str = "\n\nEXAMPLE DIALOGUE (match this tone and style):\n"
+        for ex in examples:
+            example_str += f"User: {ex.get('user', '')}\nHerbie: {ex.get('char', '')}\n---\n"
+
+    # Relationships
+    rels = character_data.get('relationships', {})
+    rel_str = "\n\nRELATIONSHIPS:\n"
+    if rels.get('creator'):
+        rel_str += f"- Creator/Dev: {rels['creator']}\n"
+    if rels.get('host'):
+        rel_str += f"- Host: {rels['host']}\n"
+    if rels.get('server'):
+        rel_str += f"- Server: {rels['server']}\n"
+    if rels.get('users'):
+        rel_str += f"- Users: {rels['users']}\n"
+
+    system_message = f"""{base_prompt}
+{example_str}
+{rel_str}
+{"Note: This person is your creator/dev. Work with them on debugging if they ask, break the fourth wall if needed." if is_creator else ""}
+
+Stay in character at all times. You are a collaborator, not a critic."""
+
+    # Build Gemini contents format
+    contents = []
+    for msg in memory[-20:]:
+        role = msg.get('role', 'user')
+        # Gemini uses 'user' and 'model' roles
+        if role == 'assistant':
+            role = 'model'
+        contents.append({"role": role, "parts": [{"text": msg['content']}]})
+
+    contents.append({"role": "user", "parts": [{"text": user_prompt}]})
+
+    # Use google-genai SDK for chat
+    try:
+        client = genai.Client(api_key=GEMINI_API_KEY)
+
+        response = await client.aio.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=contents,
+            config=genai_types.GenerateContentConfig(
+                system_instruction=system_message,
+                max_output_tokens=1000,
+            ),
+        )
+
+        if response and response.text:
+            return response.text
+        return "..."
+
+    except Exception as e:
+        print(f"Gemini API error: {e}")
+        return "Hold on now... somethin' went sideways. Try again in a sec."
+
+
+# --- BOT EVENTS ---
+
+@bot.event
+async def on_ready():
+    global character_data
+    try:
+        with open(CHARACTER_FILE, 'r', encoding='utf-8') as f:
+            character_data = json.load(f).get('data', {})
+        print(f'{bot.user} has connected to Discord!')
+        print(f"Loaded character: {character_data.get('name', 'Unknown')}")
+        print(f"Model: {GEMINI_MODEL}")
+        print(f"Audio: {'enabled' if AUDIO_PROCESSING_AVAILABLE and GEMINI_API_KEY else 'disabled'}")
+
+        synced = await bot.tree.sync()
+        print(f"Synced {len(synced)} global slash command(s)")
+
+        for guild in bot.guilds:
+            try:
+                bot.tree.copy_global_to(guild=guild)
+                guild_synced = await bot.tree.sync(guild=guild)
+                print(f"  Synced {len(guild_synced)} commands to guild: {guild.name}")
+            except Exception as ge:
+                print(f"  Failed to sync to guild {guild.name}: {ge}")
+
+        await bot.change_presence(activity=discord.Activity(
+            type=discord.ActivityType.listening,
+            name="for somethin' with soul"
+        ))
+    except Exception as e:
+        print(f"Error during startup: {e}")
+
+
+@bot.event
+async def on_message(message):
+    if message.author == bot.user:
+        return
+    if message.author.bot:
+        return
+    if "@everyone" in message.content or "@here" in message.content:
+        return
+
+    channel_id = message.channel.id
+    settings = get_channel_settings(channel_id)
+
+    is_private_chat = str(channel_id) in private_mode
+    is_mentioned = bot.user.mentioned_in(message)
+    should_respond = settings["active"] or is_mentioned or is_private_chat
+
+    if is_private_chat and str(message.author.id) != private_mode.get(str(channel_id), ""):
+        return
+
+    if should_respond:
+        async with message.channel.typing():
+            try:
+                user_id = message.author.id
+                memory = get_user_memory(user_id, channel_id)
+                user_input = message.content.replace(f'<@!{bot.user.id}>', '').replace(f'<@{bot.user.id}>', '').strip()
+
+                # --- AUDIO PROCESSING ---
+                audio_attachments = extract_audio_from_message(message)
+                if audio_attachments:
+                    for audio_info in audio_attachments:
+                        try:
+                            audio_bytes, mime_type = await download_audio_attachment(audio_info)
+                            if audio_bytes:
+                                audio_description = await understand_audio_with_gemini(
+                                    audio_bytes, mime_type,
+                                    user_context=user_input,
+                                    is_voice_message=audio_info.get('is_voice_message', False)
+                                )
+                                if audio_description:
+                                    if audio_info.get('is_voice_message', False):
+                                        user_input += f"\n\n[The user sent a voice message. Here's what they said: {audio_description}]"
+                                    else:
+                                        user_input += f"\n\n[The user shared an audio file '{audio_info['filename']}'. Here's what you heard: {audio_description}]"
+                                else:
+                                    user_input += f"\n\n[The user sent audio '{audio_info['filename']}' but the service couldn't process it right now. Acknowledge it and ask them to try again or describe what they sent.]"
+                            else:
+                                if audio_info.get('size', 0) > AUDIO_MAX_SIZE_MB * 1024 * 1024:
+                                    user_input += f"\n\n[The user sent audio '{audio_info['filename']}' but it was too large. Max is {AUDIO_MAX_SIZE_MB}MB.]"
+                                else:
+                                    user_input += f"\n\n[The user sent audio '{audio_info['filename']}' but it couldn't be downloaded.]"
+                        except Exception as audio_err:
+                            print(f"[AUDIO] Error: {audio_err}")
+                            user_input += "\n\n[The user sent audio but there was an error processing it. Acknowledge it briefly.]"
+
+                response_text = await get_gemini_response(user_input, memory, user_id=user_id)
+
+                async def send_response():
+                    bot_message = await message.reply(response_text)
+                    update_memory(user_id, channel_id, user_input, response_text, message.id, bot_message.id)
+
+                if can_send_message(channel_id):
+                    await send_response()
+                    record_message_sent(channel_id)
+                else:
+                    message_queue[channel_id].append({'callback': send_response})
+                    asyncio.create_task(process_message_queue(channel_id))
+
+            except Exception as e:
+                print(f"Error in on_message: {e}")
+                import traceback
+                traceback.print_exc()
+                await message.reply("Somethin' went sideways... try again in a sec.")
+
+    await bot.process_commands(message)
+
+
+@bot.event
+async def on_reaction_add(reaction, user):
+    if user.bot:
+        return
+    message = reaction.message
+    emoji = str(reaction.emoji)
+
+    # Dizzy emoji = regenerate response
+    if emoji == "\U0001f4ab" and message.author == bot.user and message.reference:
+        try:
+            original_msg = await message.channel.fetch_message(message.reference.message_id)
+            user_id = original_msg.author.id
+            channel_id = message.channel.id
+            memory = get_user_memory(user_id, channel_id)
+            user_input = original_msg.content.replace(f'<@!{bot.user.id}>', '').replace(f'<@{bot.user.id}>', '').strip()
+            new_response = await get_gemini_response(user_input, memory, user_id=user_id)
+            await message.edit(content=new_response)
+        except Exception as e:
+            print(f"Error regenerating: {e}")
+
+    # Wastebasket = delete Herbie's message
+    elif emoji == "\U0001f5d1\ufe0f" and message.author == bot.user:
+        try:
+            await message.delete()
+        except Exception as e:
+            print(f"Error deleting: {e}")
+
+
+# --- SLASH COMMANDS ---
+
+@bot.tree.command(name="activate", description="Activate Herbie in this channel")
+async def activate(interaction: discord.Interaction):
+    settings = get_channel_settings(interaction.channel_id)
+    settings["active"] = True
+    first_mes = character_data.get('first_mes', "Well hey now... what you got?")
+    await interaction.response.send_message(f"{first_mes}")
+
+@bot.tree.command(name="deactivate", description="Deactivate Herbie in this channel")
+async def deactivate(interaction: discord.Interaction):
+    settings = get_channel_settings(interaction.channel_id)
+    settings["active"] = False
+    private_mode.pop(str(interaction.channel_id), None)
+    await interaction.response.send_message("Alright... Herbie's headin' to the back porch. Mention me if you need me.")
+
+@bot.tree.command(name="start", description="Start a fresh conversation with Herbie")
+async def start(interaction: discord.Interaction):
+    key = f"{interaction.user.id}_{interaction.channel_id}"
+    if key in user_memories:
+        user_memories[key] = []
+    await interaction.response.send_message("Clean slate. Go on... what you workin' on?", ephemeral=True)
+
+@bot.tree.command(name="clear", description="Clear Herbie's memory of your conversation")
+async def clear(interaction: discord.Interaction):
+    await start(interaction)
+
+@bot.tree.command(name="private", description="Start a private session with Herbie")
+async def private(interaction: discord.Interaction):
+    private_mode[str(interaction.channel_id)] = str(interaction.user.id)
+    settings = get_channel_settings(interaction.channel_id)
+    settings["active"] = True
+    await interaction.response.send_message("Private session started. Just you and me.", ephemeral=True)
+
+@bot.tree.command(name="memory", description="View Herbie's memory of your conversation")
+async def memory_cmd(interaction: discord.Interaction):
+    key = f"{interaction.user.id}_{interaction.channel_id}"
+    if key in user_memories and user_memories[key]:
+        recent = user_memories[key][-5:]
+        text = "\n".join([
+            f"**{m['role'].title()}:** {m['content'][:100]}{'...' if len(m['content']) > 100 else ''}"
+            for m in recent
+        ])
+        embed = discord.Embed(title="Herbie Remembers...", description=text, color=0x8B4513)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+    else:
+        await interaction.response.send_message("Nothin' in the memory jar yet.", ephemeral=True)
+
+@bot.tree.command(name="settings", description="View Herbie's current settings")
+async def settings_cmd(interaction: discord.Interaction):
+    embed = discord.Embed(title="Herbie's Settings", color=0x8B4513)
+    embed.add_field(name="Model", value=GEMINI_MODEL, inline=True)
+    embed.add_field(name="Audio", value="Enabled" if AUDIO_PROCESSING_AVAILABLE and GEMINI_API_KEY else "Disabled", inline=True)
+    embed.add_field(name="Audio Model", value=GOOGLE_AUDIO_MODEL, inline=True)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# --- INFO ---
+
+@bot.command(name='info')
+async def info(ctx):
+    info_text = """**Herbie's Commands**
+!info — This right here
+/activate — Let Herbie listen in this channel
+/deactivate — Send Herbie to the back porch
+/start — Fresh conversation
+/clear — Clear memory
+/memory — What Herbie remembers
+/private — Private session
+/settings — View current settings
+
+**Reactions:**
+💫 on Herbie's reply — Regenerate
+🗑️ on Herbie's reply — Delete it
+
+**Utility:**
+!delete # — Delete that many messages (need manage_messages perm)
+
+**Audio:**
+Drop a track, voice memo, or audio file and Herbie will listen and give feedback."""
+    await ctx.send(info_text)
+
+@bot.command(name='help')
+async def help_command(ctx):
+    await info(ctx)
+
+@bot.command(name='delete')
+@commands.has_permissions(manage_messages=True)
+async def delete_messages(ctx, amount: int = None):
+    """Delete a specified number of messages. Usage: !delete 10"""
+    if amount is None:
+        await ctx.send("How many? Usage: `!delete 10`")
+        return
+    if amount < 1 or amount > 100:
+        await ctx.send("Keep it between 1 and 100.")
+        return
+    try:
+        # +1 to include the !delete command itself
+        deleted = await ctx.channel.purge(limit=amount + 1)
+        confirm = await ctx.channel.send(f"Cleared {len(deleted) - 1} messages.")
+        await asyncio.sleep(3)
+        await confirm.delete()
+    except discord.Forbidden:
+        await ctx.send("I don't have permission to delete messages here.")
+    except Exception as e:
+        print(f"Error deleting messages: {e}")
+        await ctx.send("Somethin' went wrong tryin' to clear those out.")
+
+@delete_messages.error
+async def delete_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("You don't have permission to delete messages.")
+    elif isinstance(error, commands.BadArgument):
+        await ctx.send("That ain't a number. Usage: `!delete 10`")
+
+
+# --- RUN ---
+if __name__ == "__main__":
+    if not DISCORD_TOKEN:
+        print("ERROR: HERBIE_DISCORD_TOKEN not set in .env")
+        print("Add your bot token: HERBIE_DISCORD_TOKEN=your_token_here")
+        sys.exit(1)
+    if not GEMINI_API_KEY:
+        print("WARNING: GEMINI_FLASH_API_KEY not set — bot will not be able to respond")
+    bot.run(DISCORD_TOKEN)
