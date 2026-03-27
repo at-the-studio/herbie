@@ -5,7 +5,7 @@ import subprocess
 import sys
 
 def install_requirements():
-    required = ['discord.py', 'python-dotenv', 'aiohttp', 'google-genai']
+    required = ['discord.py', 'python-dotenv', 'aiohttp', 'google-genai', 'mysql-connector-python']
     for package in required:
         try:
             pkg = package.replace('.py', '').replace('-', '_')
@@ -45,6 +45,16 @@ except ImportError:
     AUDIO_PROCESSING_AVAILABLE = False
     print("Audio processing: unavailable (install google-genai)")
 
+# --- MYSQL ---
+try:
+    import mysql.connector
+    from mysql.connector import pooling
+    MYSQL_AVAILABLE = True
+    print("MySQL: available")
+except ImportError:
+    MYSQL_AVAILABLE = False
+    print("MySQL: unavailable (install mysql-connector-python)")
+
 # --- CONFIGURATION ---
 load_dotenv()
 
@@ -61,6 +71,69 @@ AUDIO_CONTENT_TYPES = {
     'audio/ogg', 'audio/wav', 'audio/mp3', 'audio/mpeg',
     'audio/aac', 'audio/flac', 'audio/aiff', 'audio/x-wav', 'audio/opus'
 }
+
+# MySQL config
+MYSQL_HOST = os.getenv('MYSQL_HOST', '')
+MYSQL_PORT = int(os.getenv('MYSQL_PORT', '3306'))
+MYSQL_USER = os.getenv('MYSQL_USER', '')
+MYSQL_PASSWORD = os.getenv('MYSQL_PASSWORD', '')
+MYSQL_DATABASE = os.getenv('MYSQL_DATABASE', '')
+
+# --- DATABASE CONNECTION POOL ---
+db_pool = None
+
+def init_db():
+    """Initialize MySQL connection pool and create tables."""
+    global db_pool
+    if not MYSQL_AVAILABLE or not MYSQL_HOST:
+        print("MySQL: skipping (not configured)")
+        return False
+    try:
+        db_pool = pooling.MySQLConnectionPool(
+            pool_name="herbie_pool",
+            pool_size=5,
+            host=MYSQL_HOST,
+            port=MYSQL_PORT,
+            user=MYSQL_USER,
+            password=MYSQL_PASSWORD,
+            database=MYSQL_DATABASE,
+            charset='utf8mb4',
+            collation='utf8mb4_general_ci',
+            autocommit=True
+        )
+        # Create tables
+        conn = db_pool.get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS conversation_memory (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                channel_id BIGINT NOT NULL,
+                role VARCHAR(10) NOT NULL,
+                content TEXT NOT NULL,
+                msg_id BIGINT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                INDEX idx_user_channel (user_id, channel_id),
+                INDEX idx_created (created_at)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
+        """)
+        cursor.close()
+        conn.close()
+        print("MySQL: connected and tables ready")
+        return True
+    except Exception as e:
+        print(f"MySQL: connection failed — {e}")
+        db_pool = None
+        return False
+
+def get_db():
+    """Get a connection from the pool."""
+    if db_pool:
+        try:
+            return db_pool.get_connection()
+        except Exception as e:
+            print(f"MySQL: pool error — {e}")
+    return None
 
 # --- RATE LIMITING ---
 RATE_LIMIT_MESSAGES = 5
@@ -125,21 +198,78 @@ async def process_message_queue(channel_id):
             del message_queue[channel_id]
 
 def get_user_memory(user_id, channel_id):
+    """Load conversation memory from MySQL, fall back to in-memory cache."""
     key = f"{user_id}_{channel_id}"
+
+    # Try MySQL first
+    conn = get_db()
+    if conn:
+        try:
+            cursor = conn.cursor(dictionary=True)
+            cursor.execute("""
+                SELECT role, content, msg_id FROM conversation_memory
+                WHERE user_id = %s AND channel_id = %s
+                ORDER BY created_at DESC
+                LIMIT %s
+            """, (user_id, channel_id, max_memory_length * 2))
+            rows = cursor.fetchall()
+            cursor.close()
+            conn.close()
+
+            # Rows come newest-first, reverse for chronological order
+            rows.reverse()
+            memory = [{"role": r['role'], "content": r['content'], "id": r['msg_id']} for r in rows]
+            # Also update local cache
+            user_memories[key] = memory
+            return memory
+        except Exception as e:
+            print(f"MySQL read error: {e}")
+            if conn.is_connected():
+                conn.close()
+
+    # Fallback to in-memory
     if key not in user_memories:
         user_memories[key] = []
     return user_memories[key]
 
 def update_memory(user_id, channel_id, user_input, bot_response, user_msg_id, bot_msg_id):
+    """Save conversation to MySQL, fall back to in-memory cache."""
     key = f"{user_id}_{channel_id}"
     if key not in user_memories:
         user_memories[key] = []
+
+    # Update local cache
     if user_input:
         user_memories[key].append({"role": "user", "content": user_input, "id": user_msg_id})
     user_memories[key].append({"role": "model", "content": bot_response, "id": bot_msg_id})
-    # Trim
     if len(user_memories[key]) > max_memory_length * 2:
         user_memories[key] = user_memories[key][-(max_memory_length * 2):]
+
+    # Save to MySQL
+    conn = get_db()
+    if conn:
+        try:
+            cursor = conn.cursor()
+            if user_input:
+                cursor.execute("""
+                    INSERT INTO conversation_memory (user_id, channel_id, role, content, msg_id)
+                    VALUES (%s, %s, %s, %s, %s)
+                """, (user_id, channel_id, 'user', user_input, user_msg_id))
+            cursor.execute("""
+                INSERT INTO conversation_memory (user_id, channel_id, role, content, msg_id)
+                VALUES (%s, %s, %s, %s, %s)
+            """, (user_id, channel_id, 'model', bot_response, bot_msg_id))
+            cursor.close()
+            conn.close()
+        except Exception as e:
+            print(f"MySQL write error: {e}")
+            if conn.is_connected():
+                conn.close()
+
+def clear_user_memory(user_id, channel_id):
+    """Clear a user's LOCAL conversation cache only. MySQL stays untouched."""
+    key = f"{user_id}_{channel_id}"
+    user_memories.pop(key, None)
 
 
 # --- AUDIO FUNCTIONS (ported from Lang) ---
@@ -356,6 +486,12 @@ async def on_ready():
         print(f"Model: {GEMINI_MODEL}")
         print(f"Audio: {'enabled' if AUDIO_PROCESSING_AVAILABLE and GEMINI_API_KEY else 'disabled'}")
 
+        # Initialize MySQL
+        if init_db():
+            print("Memory: persistent (MySQL)")
+        else:
+            print("Memory: in-memory only (no MySQL)")
+
         synced = await bot.tree.sync()
         print(f"Synced {len(synced)} global slash command(s)")
 
@@ -402,7 +538,12 @@ async def on_message(message):
                 user_input = message.content.replace(f'<@!{bot.user.id}>', '').replace(f'<@{bot.user.id}>', '').strip()
 
                 # --- AUDIO PROCESSING ---
+                print(f"[DEBUG] Message has {len(message.attachments) if message.attachments else 0} attachment(s)")
+                if message.attachments:
+                    for att in message.attachments:
+                        print(f"[DEBUG]   - {att.filename} | content_type={att.content_type} | size={att.size}")
                 audio_attachments = extract_audio_from_message(message)
+                print(f"[DEBUG] Audio attachments detected: {len(audio_attachments)}")
                 if audio_attachments:
                     for audio_info in audio_attachments:
                         try:
@@ -497,14 +638,9 @@ async def deactivate(interaction: discord.Interaction):
 
 @bot.tree.command(name="start", description="Start a fresh conversation with Herbie")
 async def start(interaction: discord.Interaction):
-    key = f"{interaction.user.id}_{interaction.channel_id}"
-    if key in user_memories:
-        user_memories[key] = []
+    clear_user_memory(interaction.user.id, interaction.channel_id)
     await interaction.response.send_message("Clean slate. Go on... what you workin' on?", ephemeral=True)
 
-@bot.tree.command(name="clear", description="Clear Herbie's memory of your conversation")
-async def clear(interaction: discord.Interaction):
-    await start(interaction)
 
 @bot.tree.command(name="private", description="Start a private session with Herbie")
 async def private(interaction: discord.Interaction):
@@ -545,7 +681,6 @@ async def info(ctx):
 /activate — Let Herbie listen in this channel
 /deactivate — Send Herbie to the back porch
 /start — Fresh conversation
-/clear — Clear memory
 /memory — What Herbie remembers
 /private — Private session
 /settings — View current settings
