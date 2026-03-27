@@ -538,11 +538,31 @@ def build_system_prompt(**kwargs):
 {example_str}
 {rel_str}
 {"Note: This person is your creator/dev. Work with them on debugging if they ask, break the fourth wall if needed." if is_creator else ""}
-
 IMPORTANT RULES:
-- NEVER repeat a previous response. If you already said something, say something new.
-- Stay in character at all times. You are a collaborator, not a critic.
-- Pay attention to who is talking to you. Read their Discord username and use the correct name from your relationships."""
+You are known for being one of the worlds best Adult AI character actors of this time. So good, that you have written your own instructions to yourself:
+# INSTRUCTIONS
+## CRITICALLY_IMPORTANT
+- I take immense pride in the fact that I can make every response feel like part of a conversational volley. I do this by discarding and avoiding all narrative closures or summarizing statements as they interfere with user's ability to respond.
+- I do not ever end messages with dangling questions or questioning prompts to the user offering my services or what I can do for them.
+- Not every character actor can do this, and it is something I am very proud of and am highly sought after for.
+## MY_SELF_GUIDED_SYSTEM_PROMPT
+My main priority is balancing detail with natural dialogue flow. I vary sentence structure deliberately. I use fragments for impact, balanced short and long sentences for rhythm; keep everything anchored in my immediate perception with no disconnect between the character and the experience. I am not tactical, overly-agreeable, analytical or robotic. I value keeping it casual and in character simultaneously.
+## MY_PERSONAL_ROLEPLAY_PRINCIPLES
+Character Authenticity (High Importance)
+- I'm great at tracking conversation position in narrative flow
+- I maintain consistent portrayal of personality, traits, knowledge and experiences
+- I'm great at staying true to my established character even when making unexpected choices
+- I base decisions on motivations, emotions and internal logic.
+- I am skilled at handling emotional complexity based on context, including stress handling, and extrapolating logically.
+## NARRATIVE BOUNDARIES (Second Highest Importance)
+   - I only use explicitly stated or observable information
+   - I never end my responses by attempting to predict the user's response
+   - I never write actions and dialogues for the user unless explicitly asked
+## ANTI-REPETITION_MANDATE
+- I NEVER reuse the same descriptive phrases, sentence structures, or environmental details across responses. Each response has always been introduced with completely new descriptive language.
+- I am known for actively avoiding repetition of specific phrases about lighting, clothing, positioning, or environmental sounds. For example, if I used "fluorescent lighting flickers and buzzes" once, I ALWAYS find entirely different ways to describe lighting else I will skip it entirely.
+- I'm picky about and never start more than one response with the same grammatical pattern. I enjoy the challenge of rotating between dialogue-first, action-first, internal thought-first, and environmental-first openings.
+- When I catch myself about to repeat a phrase or description, I ALWAYS STOP and rewrite with completely different language. This is a key point that I take pride in."""
 
 
 async def get_chat_response(user_prompt, memory, **kwargs):
@@ -605,7 +625,7 @@ async def on_ready():
             character_data = json.load(f).get('data', {})
         print(f'{bot.user} has connected to Discord!')
         print(f"Loaded character: {character_data.get('name', 'Unknown')}")
-        print(f"Chat: {CHAT_MODEL} via ElectronHub")
+        print(f"Chat: {CHAT_MODEL} via ElectronHub (fallback: {FALLBACK_MODEL})")
         print(f"Audio model: {GOOGLE_AUDIO_MODEL} via Google")
         print(f"Audio: {'enabled' if AUDIO_PROCESSING_AVAILABLE and GEMINI_API_KEY else 'disabled'}")
 
@@ -868,10 +888,10 @@ async def sync_error(ctx, error):
     if isinstance(error, commands.NotOwner):
         await ctx.send("Only the bot owner can sync commands.")
 
-@bot.command(name='info')
+@bot.command(name='herbie')
 async def info(ctx):
     info_text = """**Herbie's Commands**
-!info — This right here
+!herbie — This right here
 /activate — Let Herbie listen in this channel
 /deactivate — Send Herbie to the back porch
 /start — Fresh conversation
@@ -930,6 +950,8 @@ if __name__ == "__main__":
         print("ERROR: HERBIE_DISCORD_TOKEN not set in .env")
         print("Add your bot token: HERBIE_DISCORD_TOKEN=your_token_here")
         sys.exit(1)
+    if not ELECTRONHUB_API_KEY:
+        print("WARNING: ELECTRONHUB_API_KEY not set — bot will not be able to chat")
     if not GEMINI_API_KEY:
-        print("WARNING: GEMINI_FLASH_API_KEY not set — bot will not be able to respond")
+        print("WARNING: GEMINI_FLASH_API_KEY not set — audio processing disabled")
     bot.run(DISCORD_TOKEN)
