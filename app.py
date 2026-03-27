@@ -182,6 +182,41 @@ def can_send_message(channel_id):
 def record_message_sent(channel_id):
     channel_message_history[channel_id].append(time.time())
 
+def split_message(text, limit=2000):
+    """Split a long message into chunks under Discord's 2000 char limit.
+    Tries to break at newlines, then sentences, then spaces."""
+    if len(text) <= limit:
+        return [text]
+
+    chunks = []
+    while len(text) > limit:
+        # Try to break at a double newline
+        split_at = text.rfind('\n\n', 0, limit)
+        if split_at == -1 or split_at < limit // 2:
+            # Try single newline
+            split_at = text.rfind('\n', 0, limit)
+        if split_at == -1 or split_at < limit // 2:
+            # Try sentence end
+            for sep in ['. ', '! ', '? ']:
+                split_at = text.rfind(sep, 0, limit)
+                if split_at != -1 and split_at >= limit // 2:
+                    split_at += 1  # include the punctuation
+                    break
+        if split_at == -1 or split_at < limit // 2:
+            # Try space
+            split_at = text.rfind(' ', 0, limit)
+        if split_at == -1 or split_at < limit // 2:
+            # Hard cut
+            split_at = limit
+
+        chunks.append(text[:split_at].rstrip())
+        text = text[split_at:].lstrip()
+
+    if text:
+        chunks.append(text)
+    return chunks
+
+
 async def process_message_queue(channel_id):
     if channel_id in processing_queue:
         return
@@ -693,12 +728,21 @@ async def on_message(message):
                 response_text = await get_chat_response(user_input, memory, user_id=user_id)
 
                 async def send_response():
-                    try:
-                        bot_message = await message.reply(response_text)
-                    except discord.HTTPException:
-                        # Original message was deleted, just send to channel
-                        bot_message = await message.channel.send(response_text)
-                    update_memory(user_id, channel_id, user_input, response_text, message.id, bot_message.id)
+                    chunks = split_message(response_text)
+                    bot_message = None
+                    for i, chunk in enumerate(chunks):
+                        try:
+                            if i == 0:
+                                try:
+                                    bot_message = await message.reply(chunk)
+                                except discord.HTTPException:
+                                    bot_message = await message.channel.send(chunk)
+                            else:
+                                bot_message = await message.channel.send(chunk)
+                        except Exception as e:
+                            print(f"Error sending chunk {i}: {e}")
+                    if bot_message:
+                        update_memory(user_id, channel_id, user_input, response_text, message.id, bot_message.id)
 
                 if can_send_message(channel_id):
                     await send_response()
