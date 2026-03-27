@@ -62,7 +62,7 @@ DISCORD_TOKEN = os.getenv('HERBIE_DISCORD_TOKEN')
 GEMINI_API_KEY = os.getenv('GEMINI_FLASH_API_KEY')  # For audio analysis only
 ELECTRONHUB_API_KEY = os.getenv('ELECTRONHUB_API_KEY')  # For chat
 ELECTRONHUB_ENDPOINT = os.getenv('ELECTRONHUB_ENDPOINT', 'https://api.electronhub.ai/v1/chat/completions')
-CHAT_MODEL = os.getenv('CHAT_MODEL', 'gemini-2.5-flash-lite')
+CHAT_MODEL = os.getenv('CHAT_MODEL', 'gemini-2.5-flash')
 CHARACTER_FILE = 'herbie_character.json'
 CREATOR_ID = 966507927756234823  # myra_cat / mj — dev
 
