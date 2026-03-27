@@ -59,8 +59,10 @@ except ImportError:
 load_dotenv()
 
 DISCORD_TOKEN = os.getenv('HERBIE_DISCORD_TOKEN')
-GEMINI_API_KEY = os.getenv('GEMINI_FLASH_API_KEY')
-GEMINI_MODEL = os.getenv('HERBIE_MODEL', 'gemini-3-flash-preview')
+GEMINI_API_KEY = os.getenv('GEMINI_FLASH_API_KEY')  # For audio analysis only
+ELECTRONHUB_API_KEY = os.getenv('ELECTRONHUB_API_KEY')  # For chat
+ELECTRONHUB_ENDPOINT = os.getenv('ELECTRONHUB_ENDPOINT', 'https://api.electronhub.ai/v1/chat/completions')
+CHAT_MODEL = os.getenv('CHAT_MODEL', 'gemini-2.5-flash-lite')
 CHARACTER_FILE = 'herbie_character.json'
 CREATOR_ID = 966507927756234823  # myra_cat / mj — dev
 
@@ -468,18 +470,16 @@ async def download_suno_audio(audio_url):
         return None, None
 
 
-# --- GEMINI CHAT API ---
+# --- ELECTRONHUB CHAT API ---
 
-async def get_gemini_response(user_prompt, memory, **kwargs):
-    """Get a response from Gemini API."""
+def build_system_prompt(**kwargs):
+    """Build the system prompt from character data."""
     is_creator = str(kwargs.get('user_id')) == str(CREATOR_ID) if CREATOR_ID else False
 
-    # Use the full system prompt from character.json if available, otherwise build one
     base_prompt = character_data.get('system_prompt', '')
     if not base_prompt:
         base_prompt = f"You are {character_data.get('name', 'Herbie the Holler Bot')}.\n{character_data.get('description', '')}\nPersonality: {character_data.get('personality', '')}"
 
-    # Build example dialogue string
     examples = character_data.get('example_dialogue', [])
     example_str = ""
     if examples:
@@ -487,7 +487,6 @@ async def get_gemini_response(user_prompt, memory, **kwargs):
         for ex in examples:
             example_str += f"User: {ex.get('user', '')}\nHerbie: {ex.get('char', '')}\n---\n"
 
-    # Relationships
     rels = character_data.get('relationships', {})
     rel_str = "\n\nRELATIONSHIPS:\n"
     if rels.get('creator'):
@@ -499,43 +498,51 @@ async def get_gemini_response(user_prompt, memory, **kwargs):
     if rels.get('users'):
         rel_str += f"- Users: {rels['users']}\n"
 
-    system_message = f"""{base_prompt}
+    return f"""{base_prompt}
 {example_str}
 {rel_str}
 {"Note: This person is your creator/dev. Work with them on debugging if they ask, break the fourth wall if needed." if is_creator else ""}
 
 Stay in character at all times. You are a collaborator, not a critic."""
 
-    # Build Gemini contents format
-    contents = []
+
+async def get_chat_response(user_prompt, memory, **kwargs):
+    """Get a response from ElectronHub (OpenAI-compatible API)."""
+    system_message = build_system_prompt(**kwargs)
+
+    # Build OpenAI-format messages
+    messages = [{"role": "system", "content": system_message}]
     for msg in memory[-20:]:
         role = msg.get('role', 'user')
-        # Gemini uses 'user' and 'model' roles
-        if role == 'assistant':
-            role = 'model'
-        contents.append({"role": role, "parts": [{"text": msg['content']}]})
+        # ElectronHub uses 'assistant' not 'model'
+        if role == 'model':
+            role = 'assistant'
+        messages.append({"role": role, "content": msg['content']})
+    messages.append({"role": "user", "content": user_prompt})
 
-    contents.append({"role": "user", "parts": [{"text": user_prompt}]})
+    headers = {
+        "Authorization": f"Bearer {ELECTRONHUB_API_KEY}",
+        "Content-Type": "application/json"
+    }
 
-    # Use google-genai SDK for chat
+    payload = {
+        "model": CHAT_MODEL,
+        "messages": messages,
+        "max_tokens": 1000
+    }
+
     try:
-        client = genai.Client(api_key=GEMINI_API_KEY)
-
-        response = await client.aio.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=contents,
-            config=genai_types.GenerateContentConfig(
-                system_instruction=system_message,
-                max_output_tokens=1000,
-            ),
-        )
-
-        if response and response.text:
-            return response.text
-        return "..."
-
+        async with aiohttp.ClientSession() as session:
+            async with session.post(ELECTRONHUB_ENDPOINT, headers=headers, json=payload) as response:
+                if response.status == 200:
+                    result = await response.json()
+                    return result['choices'][0]['message']['content']
+                else:
+                    error_text = await response.text()
+                    print(f"ElectronHub API error: {response.status} - {error_text}")
+                    return "Hold on now... somethin' went sideways. Try again in a sec."
     except Exception as e:
-        print(f"Gemini API error: {e}")
+        print(f"ElectronHub API error: {e}")
         return "Hold on now... somethin' went sideways. Try again in a sec."
 
 
@@ -549,7 +556,8 @@ async def on_ready():
             character_data = json.load(f).get('data', {})
         print(f'{bot.user} has connected to Discord!')
         print(f"Loaded character: {character_data.get('name', 'Unknown')}")
-        print(f"Model: {GEMINI_MODEL}")
+        print(f"Chat: {CHAT_MODEL} via ElectronHub")
+        print(f"Audio model: {GOOGLE_AUDIO_MODEL} via Google")
         print(f"Audio: {'enabled' if AUDIO_PROCESSING_AVAILABLE and GEMINI_API_KEY else 'disabled'}")
 
         # Initialize MySQL
@@ -668,7 +676,7 @@ async def on_message(message):
                             print(f"[SUNO] Error: {suno_err}")
                             user_input += f"\n\n[The user shared a Suno link but there was an error processing it. Acknowledge it.]"
 
-                response_text = await get_gemini_response(user_input, memory, user_id=user_id)
+                response_text = await get_chat_response(user_input, memory, user_id=user_id)
 
                 async def send_response():
                     try:
@@ -712,7 +720,7 @@ async def on_reaction_add(reaction, user):
             channel_id = message.channel.id
             memory = get_user_memory(user_id, channel_id)
             user_input = original_msg.content.replace(f'<@!{bot.user.id}>', '').replace(f'<@{bot.user.id}>', '').strip()
-            new_response = await get_gemini_response(user_input, memory, user_id=user_id)
+            new_response = await get_chat_response(user_input, memory, user_id=user_id)
             await message.edit(content=new_response)
         except Exception as e:
             print(f"Error regenerating: {e}")
