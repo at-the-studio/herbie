@@ -837,7 +837,7 @@ async def memory_cmd(interaction: discord.Interaction):
 @bot.tree.command(name="settings", description="View Herbie's current settings")
 async def settings_cmd(interaction: discord.Interaction):
     embed = discord.Embed(title="Herbie's Settings", color=0x8B4513)
-    embed.add_field(name="Model", value=GEMINI_MODEL, inline=True)
+    embed.add_field(name="Model", value=f"{CHAT_MODEL} (fallback: {FALLBACK_MODEL})", inline=True)
     embed.add_field(name="Audio", value="Enabled" if AUDIO_PROCESSING_AVAILABLE and GEMINI_API_KEY else "Disabled", inline=True)
     embed.add_field(name="Audio Model", value=GOOGLE_AUDIO_MODEL, inline=True)
     await interaction.response.send_message(embed=embed, ephemeral=True)
