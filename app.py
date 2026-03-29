@@ -759,22 +759,23 @@ async def on_message(message):
 
                 response_text = await get_chat_response(user_input, memory, user_id=user_id)
 
+                # Save to memory immediately so the next message gets fresh context
+                # even if the Discord send is queued/delayed
+                update_memory(user_id, channel_id, user_input, response_text, message.id, None)
+
                 async def send_response():
                     chunks = split_message(response_text)
-                    bot_message = None
                     for i, chunk in enumerate(chunks):
                         try:
                             if i == 0:
                                 try:
-                                    bot_message = await message.reply(chunk)
+                                    await message.reply(chunk)
                                 except discord.HTTPException:
-                                    bot_message = await message.channel.send(chunk)
+                                    await message.channel.send(chunk)
                             else:
-                                bot_message = await message.channel.send(chunk)
+                                await message.channel.send(chunk)
                         except Exception as e:
                             print(f"Error sending chunk {i}: {e}")
-                    if bot_message:
-                        update_memory(user_id, channel_id, user_input, response_text, message.id, bot_message.id)
 
                 if can_send_message(channel_id):
                     await send_response()
