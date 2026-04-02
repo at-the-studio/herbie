@@ -66,6 +66,7 @@ CHAT_MODEL = os.getenv('CHAT_MODEL', 'gemini-2.5-flash')
 FALLBACK_MODEL = os.getenv('FALLBACK_MODEL', 'llama-4-maverick-17b-128e-instruct')
 CHARACTER_FILE = 'herbie_character.json'
 CREATOR_ID = 966507927756234823  # myra_cat / mj — dev
+ERROR_CHANNEL_ID = 1466238487425581097  # mj's personal server tickets channel
 
 # Audio config
 GOOGLE_AUDIO_MODEL = os.getenv('GOOGLE_AUDIO_MODEL', 'gemini-3-flash-preview')
@@ -625,6 +626,28 @@ async def get_chat_response(user_prompt, memory, **kwargs):
     return "Hold on now... somethin' went sideways. Try again in a sec."
 
 
+# --- ERROR REPORTING ---
+
+async def report_error(error: Exception, context: str = ""):
+    """Send error details to mj's personal server channel."""
+    try:
+        channel = bot.get_channel(ERROR_CHANNEL_ID)
+        if not channel:
+            channel = await bot.fetch_channel(ERROR_CHANNEL_ID)
+        if channel:
+            import traceback
+            tb = traceback.format_exc()
+            msg = f"🚨 **Herbie Error**\n"
+            if context:
+                msg += f"**Where:** {context}\n"
+            msg += f"**Error:** `{type(error).__name__}: {str(error)[:200]}`\n"
+            if tb and tb.strip() != "NoneType: None":
+                msg += f"```\n{tb[-800:]}\n```"
+            await channel.send(msg)
+    except Exception as report_err:
+        print(f"[ERROR REPORT] Failed to send error report: {report_err}")
+
+
 # --- BOT EVENTS ---
 
 @bot.event
@@ -788,6 +811,7 @@ async def on_message(message):
                 print(f"Error in on_message: {e}")
                 import traceback
                 traceback.print_exc()
+                asyncio.create_task(report_error(e, f"on_message in #{message.channel.name} ({message.guild.name if message.guild else 'DM'})"))
                 try:
                     await message.reply("Somethin' went sideways... try again in a sec.")
                 except discord.HTTPException:
@@ -815,6 +839,7 @@ async def on_reaction_add(reaction, user):
             await message.edit(content=new_response)
         except Exception as e:
             print(f"Error regenerating: {e}")
+            asyncio.create_task(report_error(e, "on_reaction_add (regenerate)"))
 
     # Wastebasket = delete Herbie's message
     elif emoji == "\U0001f5d1\ufe0f" and message.author == bot.user:
@@ -822,6 +847,7 @@ async def on_reaction_add(reaction, user):
             await message.delete()
         except Exception as e:
             print(f"Error deleting: {e}")
+            asyncio.create_task(report_error(e, "on_reaction_add (delete)"))
 
 
 # --- SLASH COMMANDS ---
