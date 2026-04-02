@@ -540,9 +540,18 @@ def build_system_prompt(**kwargs):
     if rels.get('users'):
         rel_str += f"- Users: {rels['users']}\n"
 
+    # Build sticker reference
+    stickers = character_data.get('stickers', {})
+    sticker_str = ""
+    if stickers and stickers.get('list'):
+        sticker_str = "\n\nSTICKERS (use these image URLs as expressive reactions — send the URL on its own line so Discord embeds it as a big image. Use sparingly and naturally, not every message):\n"
+        for name, info in stickers['list'].items():
+            sticker_str += f"- {name}: {info['url']} — {info['use_when']}\n"
+
     return f"""{base_prompt}
 {example_str}
 {rel_str}
+{sticker_str}
 {"Note: This person is your creator/dev. Work with them on debugging if they ask, break the fourth wall if needed." if is_creator else ""}
 IMPORTANT RULES:
 TONE & LANGUAGE:
