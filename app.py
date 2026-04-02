@@ -737,7 +737,7 @@ async def on_message(message):
                                     is_voice_message=audio_info.get('is_voice_message', False)
                                 )
                                 if audio_description == "BUSY":
-                                    user_input += f"\n\n[The user sent audio but the audio analysis model is currently overloaded with traffic. Tell them in your own voice that the listening model is slammed right now and to try dropping it again in a minute.]"
+                                    user_input += f"\n\n[The user sent audio but the audio analysis model is overloaded. Say exactly this: \"Seems my trusty language model is gettin slammed with traffic right about now, give us a breather and let the traffic wind down and then I will be ready for ya!\"]"
                                 elif audio_description:
                                     if audio_info.get('is_voice_message', False):
                                         user_input += f"\n\n[The user sent a voice message. Here's what they said: {audio_description}]"
@@ -773,7 +773,7 @@ async def on_message(message):
                                         is_voice_message=False
                                     )
                                     if audio_description == "BUSY":
-                                        user_input += f"\n\n[The user shared a Suno track ({suno_link}) but the audio analysis model is slammed right now. Tell them in your own voice that your ears are backed up and to try again in a minute.]"
+                                        user_input += f"\n\n[The user shared a Suno track but the audio analysis model is overloaded. Say exactly this: \"Seems my trusty language model is gettin slammed with traffic right about now, give us a breather and let the traffic wind down and then I will be ready for ya!\"]"
                                     elif audio_description:
                                         track_title = suno_info.get('title', 'Unknown Track')
                                         user_input += f'\n\n[The user shared a Suno track "{track_title}" ({suno_link}). Here\'s what you heard: {audio_description}]'
