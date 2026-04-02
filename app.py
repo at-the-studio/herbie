@@ -438,6 +438,10 @@ Be thorough and natural. This will be used by a music collaborator character to 
         return None
 
     except Exception as e:
+        error_str = str(e).lower()
+        if any(x in error_str for x in ["503", "overload", "unavailable", "resource_exhausted", "quota", "busy"]):
+            print(f"[AUDIO] Model busy/overloaded: {e}")
+            return "BUSY"
         print(f"[AUDIO] Analysis error: {e}")
         return None
 
@@ -732,13 +736,15 @@ async def on_message(message):
                                     user_context=user_input,
                                     is_voice_message=audio_info.get('is_voice_message', False)
                                 )
-                                if audio_description:
+                                if audio_description == "BUSY":
+                                    user_input += f"\n\n[The user sent audio but the audio analysis model is currently overloaded with traffic. Tell them in your own voice that the listening model is slammed right now and to try dropping it again in a minute.]"
+                                elif audio_description:
                                     if audio_info.get('is_voice_message', False):
                                         user_input += f"\n\n[The user sent a voice message. Here's what they said: {audio_description}]"
                                     else:
                                         user_input += f"\n\n[The user shared an audio file '{audio_info['filename']}'. Here's what you heard: {audio_description}]"
                                 else:
-                                    user_input += f"\n\n[The user sent audio '{audio_info['filename']}' but the service couldn't process it right now. Acknowledge it and ask them to try again or describe what they sent.]"
+                                    user_input += f"\n\n[The user sent audio '{audio_info['filename']}' but the service couldn't process it. Acknowledge it and ask them to try again.]"
                             else:
                                 if audio_info.get('size', 0) > AUDIO_MAX_SIZE_MB * 1024 * 1024:
                                     user_input += f"\n\n[The user sent audio '{audio_info['filename']}' but it was too large. Max is {AUDIO_MAX_SIZE_MB}MB.]"
@@ -766,7 +772,9 @@ async def on_message(message):
                                         user_context=user_input,
                                         is_voice_message=False
                                     )
-                                    if audio_description:
+                                    if audio_description == "BUSY":
+                                        user_input += f"\n\n[The user shared a Suno track ({suno_link}) but the audio analysis model is slammed right now. Tell them in your own voice that your ears are backed up and to try again in a minute.]"
+                                    elif audio_description:
                                         track_title = suno_info.get('title', 'Unknown Track')
                                         user_input += f'\n\n[The user shared a Suno track "{track_title}" ({suno_link}). Here\'s what you heard: {audio_description}]'
                                         print(f"[SUNO] Audio analysis injected ({len(audio_description)} chars)")
